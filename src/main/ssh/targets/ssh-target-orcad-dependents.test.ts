@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { getDefaultWorkspaceSession } from '../../../shared/constants'
+import {
+  FLOATING_TERMINAL_WORKTREE_ID,
+  getDefaultWorkspaceSession
+} from '../../../shared/constants'
+import { getAllWorktreeMetaForHost } from '../../persistence/loading-store/worktree-identity-metadata'
 import type { ExecutionHostId } from '../../../shared/execution-host'
 import { collectDependentStateBlockers } from './ssh-target-orcad-dependents'
 import { emptyDependentStateStore } from './ssh-target-orcad-dependents-fixture'
@@ -103,13 +107,50 @@ describe('client state that still references an SSH target', () => {
   })
 
   it('blocks on worktree metadata recorded for the host', () => {
-    // oxlint-disable-next-line typescript/consistent-type-assertions -- SAFETY: the census reads only the keys.
-    const meta = { 'repo-1::/srv/app': {} } as never
+    // oxlint-disable-next-line typescript/consistent-type-assertions -- SAFETY: the census reads the host stamp and the worktree id.
+    const meta = { 'repo-1::/srv/app': { hostId: HOST } } as never
     expect(
       messageFor({
         getAllWorktreeMetaForHost: (hostId) => (hostId === HOST ? meta : {})
       })
     ).toContain('worktree-metadata ×1 (repo-1::/srv/app)')
+  })
+
+  it('does not count an unstamped global floating terminal as dependent state of an SSH target', () => {
+    const legacyRows = {
+      worktreeMeta: {
+        [FLOATING_TERMINAL_WORKTREE_ID]: {
+          instanceId: '11111111-1111-4111-8111-111111111111',
+          displayName: '',
+          comment: '',
+          isUnread: false,
+          sortOrder: 1,
+          lastActivityAt: 1,
+          workspaceStatus: 'in-progress'
+        },
+        'onboarding-setup-terminal': {
+          displayName: 'setup',
+          comment: '',
+          isUnread: false,
+          sortOrder: 2,
+          lastActivityAt: 2
+        }
+      },
+      worktreeMetaByIdentity: {},
+      worktreeIdentityAliases: {}
+    }
+    // oxlint-disable-next-line typescript/consistent-type-assertions -- SAFETY: the host projection reads hostId and the locator map only.
+    const state = legacyRows as unknown as Parameters<typeof getAllWorktreeMetaForHost>[0]['state']
+
+    const projected = getAllWorktreeMetaForHost({ state }, HOST)
+    expect(projected).toHaveProperty(FLOATING_TERMINAL_WORKTREE_ID)
+    expect(projected).toHaveProperty('onboarding-setup-terminal')
+    expect(projected[FLOATING_TERMINAL_WORKTREE_ID]?.hostId).toBeUndefined()
+    expect(
+      blockersFor({
+        getAllWorktreeMetaForHost: (hostId) => getAllWorktreeMetaForHost({ state }, hostId)
+      })
+    ).toEqual([])
   })
 
   it('blocks on a saved terminal lease of any status', () => {

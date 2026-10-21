@@ -40,7 +40,14 @@ export function collectDependentStateBlockers(
           .filter((a) => a.executionTargetType === 'ssh' && a.executionTargetId === targetId)
           .map((a) => a.name)
     ],
-    ['worktree-metadata', () => Object.keys(store.getAllWorktreeMetaForHost(hostId))],
+    [
+      'worktree-metadata',
+      // Missing hostId is host-agnostic and getAllWorktreeMetaForHost projects it onto every host.
+      () =>
+        Object.entries(store.getAllWorktreeMetaForHost(hostId))
+          .filter(([, meta]) => meta.hostId === hostId)
+          .map(([worktreeId]) => worktreeId)
+    ],
     // Why every status: a terminated lease is still a saved record pointing at this host.
     [
       'terminal-lease',
