@@ -58,8 +58,43 @@ function resolveSelectedSkillNames(
   return [...canonicalNames].sort()
 }
 
-/** PATH with the resolved npx's own directory first, so its `env node` shebang resolves. */
+// Why: a long clone prints a lot of progress; the failure lines are at the end.
+const SKILLS_FAILURE_OUTPUT_TAIL = 64 * 1024
 
+function skillsAddOutputReportsFailure(output: string): boolean {
+  // Why: skills prints these and can still exit 0 (clack's exit hook). The
+  // swallowed SHA-fallback error stays in the skills CLI; we only stop
+  // reporting that outcome as success.
+  return (
+    output.includes('Installation failed') ||
+    (output.includes('Canceled') && output.includes('Failed to clone'))
+  )
+}
+
+function exitCodeForSkillsChild(
+  code: number | null,
+  signal: NodeJS.Signals | null,
+  output: string
+): number {
+  const numeric = typeof code === 'number' ? code : signal ? 1 : 0
+  if (numeric !== 0) {
+    return numeric
+  }
+  return skillsAddOutputReportsFailure(output) ? 1 : 0
+}
+
+function appendSkillsChildOutput(
+  tail: string,
+  chunk: Buffer | string,
+  sink: NodeJS.WriteStream
+): string {
+  sink.write(chunk)
+  const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8')
+  const next = tail + text
+  return next.length > SKILLS_FAILURE_OUTPUT_TAIL ? next.slice(-SKILLS_FAILURE_OUTPUT_TAIL) : next
+}
+
+/** PATH with the resolved npx's own directory first, so its `env node` shebang resolves. */
 function runNpxSkills(args: string[]): Promise<number> {
   return new Promise((resolve, reject) => {
     // Why: a bare PATH lookup misses nvm/fnm/volta installs, and hardcoding
@@ -89,16 +124,39 @@ function runNpxSkills(args: string[]): Promise<number> {
     // Why: npx is an `#!/usr/bin/env node` script, so resolving it off PATH is
     // not enough — without node alongside it the child exits 127 with no
     // 'error' event and the message below never fires.
+    // Why: inherit would show a failure but hide it from us. Pipe stdout and
+    // stderr so a 0 exit that still printed "Installation failed" / "Canceled"
+    // becomes a failed command, and replay the bytes for the operator.
     const child = spawn(spawnCmd, spawnArgs, {
-      stdio: 'inherit',
+      stdio: ['inherit', 'pipe', 'pipe'],
       // Why the shared helper: it verifies the sibling node actually exists,
       // skips a bare-name fallback whose dirname is '.', and writes the key
       // Windows will really read — all of which a local join got wrong.
       env: withCliRuntimeOnPath(resolved, { ...process.env, ...SKILLS_CLI_ENV_OVERRIDES })
     })
+    let outputTail = ''
+    let settled = false
+    const finish = (code: number | null, signal: NodeJS.Signals | null): void => {
+      if (settled) {
+        return
+      }
+      settled = true
+      resolve(exitCodeForSkillsChild(code, signal, outputTail))
+    }
+    const track = (stream: NodeJS.ReadableStream | null, sink: NodeJS.WriteStream): void => {
+      stream?.on('data', (chunk: Buffer | string) => {
+        outputTail = appendSkillsChildOutput(outputTail, chunk, sink)
+      })
+    }
+    track(child.stdout, process.stdout)
+    track(child.stderr, process.stderr)
     // Why: a missing npx/Node on a headless host surfaces as a raw spawn ENOENT;
     // wrap it so the CLI reports an actionable message like every other failure here.
     child.once('error', (error) => {
+      if (settled) {
+        return
+      }
+      settled = true
       const detail = error instanceof Error ? error.message : String(error)
       reject(
         new RuntimeClientError(
@@ -107,9 +165,13 @@ function runNpxSkills(args: string[]): Promise<number> {
         )
       )
     })
-    child.once('exit', (code, signal) => {
-      resolve(typeof code === 'number' ? code : signal ? 1 : 0)
-    })
+    // Why: 'close' follows the last stdio chunk. Tests that omit streams only
+    // emit 'exit', which is enough when there is nothing to capture.
+    if (child.stdout || child.stderr) {
+      child.once('close', (code, signal) => finish(code, signal))
+    } else {
+      child.once('exit', (code, signal) => finish(code, signal))
+    }
   })
 }
 
@@ -242,7 +304,7 @@ function createSkillMutationHandler(verb: SkillMutationVerb): CommandHandler {
     }
 
     if (json) {
-      // Why: a real run inherits npx's own stdout so progress stays visible live;
+      // Why: a real run streams npx's own stdout so progress stays visible live;
       // that stream is not JSON, so --json can't be honored here.
       throw new RuntimeClientError(
         'invalid_argument',
@@ -251,7 +313,7 @@ function createSkillMutationHandler(verb: SkillMutationVerb): CommandHandler {
       )
     }
 
-    // Why: stdio is inherited for the child below, so this status line must go to
+    // Why: the child's stdout is replayed below, so this status line must go to
     // stderr — stdout is npx's own output, not this command's JSON channel.
     process.stderr.write(`Running: ${command}\n`)
     process.exitCode = await runNpxSkills(npxArgs)

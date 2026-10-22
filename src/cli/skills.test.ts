@@ -15,6 +15,7 @@ const PINNED_ADD = [
   `https://github.com/stablyai/orca/tree/${COMMIT}`
 ]
 const DETECTED_AGENTS = ['--agent', 'claude-code', '--agent', 'universal']
+const NPX_STDIO = ['inherit', 'pipe', 'pipe']
 
 const {
   detectCommandsMock,
@@ -428,7 +429,7 @@ describe('orca skills CLI', () => {
     expect(spawnMock).toHaveBeenCalledWith(
       'npx',
       [...PINNED_ADD, '--skill', 'alpha', ...DETECTED_AGENTS, '-y'],
-      expect.objectContaining({ stdio: 'inherit', env: expect.objectContaining({ LC_ALL: 'C' }) })
+      expect.objectContaining({ stdio: NPX_STDIO, env: expect.objectContaining({ LC_ALL: 'C' }) })
     )
   })
 
@@ -461,7 +462,7 @@ describe('orca skills CLI', () => {
         ...DETECTED_AGENTS,
         '-y'
       ],
-      expect.objectContaining({ stdio: 'inherit' })
+      expect.objectContaining({ stdio: NPX_STDIO })
     )
   })
 
@@ -496,7 +497,7 @@ describe('orca skills CLI', () => {
     expect(spawnMock).toHaveBeenCalledWith(
       'npx',
       [...PINNED_ADD, '--skill', 'alpha', '--global', ...DETECTED_AGENTS, '-y'],
-      expect.objectContaining({ stdio: 'inherit' })
+      expect.objectContaining({ stdio: NPX_STDIO })
     )
   })
 
@@ -524,7 +525,7 @@ describe('orca skills CLI', () => {
         ...DETECTED_AGENTS,
         '-y'
       ],
-      expect.objectContaining({ stdio: 'inherit' })
+      expect.objectContaining({ stdio: NPX_STDIO })
     )
     expect(process.exitCode).toBe(1)
   })
@@ -613,7 +614,7 @@ describe('orca skills CLI', () => {
     expect(spawnMock).toHaveBeenCalledWith(
       'npx',
       [...PINNED_ADD, '--skill', 'alpha', ...DETECTED_AGENTS, '-y'],
-      expect.objectContaining({ stdio: 'inherit' })
+      expect.objectContaining({ stdio: NPX_STDIO })
     )
   })
 
@@ -910,7 +911,7 @@ describe('orca skills CLI', () => {
     expect(spawnMock).toHaveBeenCalledWith(
       'npx',
       [...PINNED_ADD, '--skill', 'alpha', '--skill', 'zeta', '--global', ...DETECTED_AGENTS, '-y'],
-      expect.objectContaining({ stdio: 'inherit' })
+      expect.objectContaining({ stdio: NPX_STDIO })
     )
   })
 
@@ -969,7 +970,7 @@ describe('orca skills CLI', () => {
         ...DETECTED_AGENTS,
         '-y'
       ],
-      expect.objectContaining({ stdio: 'inherit' })
+      expect.objectContaining({ stdio: NPX_STDIO })
     )
     expect(process.exitCode).toBe(2)
   })
