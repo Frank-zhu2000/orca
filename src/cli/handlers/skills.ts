@@ -5,6 +5,7 @@ import { getRepeatedStringFlag } from '../flags'
 import { writeStdoutLine } from '../stdout-line'
 import { loadCanonicalGuides, type BundledSkillGuide } from './bundled-skill-guide-table'
 import { SKILL_GUIDE_GET_HANDLER } from './skill-guide-get'
+import { guardSkillsChildPipes } from './skills-child-stdio'
 import { resolveCliCommand, withCliRuntimeOnPath } from '../../shared/node-cli-command-resolution'
 import {
   getSpawnArgsForWindows,
@@ -62,12 +63,16 @@ function resolveSelectedSkillNames(
 const SKILLS_FAILURE_OUTPUT_TAIL = 64 * 1024
 
 function skillsAddOutputReportsFailure(output: string): boolean {
-  // Why: skills prints these and can still exit 0 (clack's exit hook). The
-  // swallowed SHA-fallback error stays in the skills CLI; we only stop
-  // reporting that outcome as success.
+  // Why: a non-zero child status is forwarded unchanged. skills@1.7.2 already
+  // exits 1 on a clone failure; clack's exit hook only appends "Canceled" and
+  // does not change that code. A partial install can still print
+  // "Failed to install <n>" and "Done!" and exit 0. The clone lines stay so a
+  // 0 status that still printed them is not reported as success. "Symlinks
+  // failed" and "Failed to install find-skills" are not that count.
   return (
     output.includes('Installation failed') ||
-    (output.includes('Canceled') && output.includes('Failed to clone'))
+    (output.includes('Canceled') && output.includes('Failed to clone')) ||
+    /Failed to install \d+/.test(output)
   )
 }
 
@@ -86,9 +91,14 @@ function exitCodeForSkillsChild(
 function appendSkillsChildOutput(
   tail: string,
   chunk: Buffer | string,
-  sink: NodeJS.WriteStream
+  sink: NodeJS.WriteStream,
+  pipeClosed: boolean
 ): string {
-  sink.write(chunk)
+  // Why: after EPIPE the sink is dead. Further writes raise again and can
+  // escape as an unhandled `error` before `close` records the child status.
+  if (!pipeClosed) {
+    sink.write(chunk)
+  }
   const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8')
   const next = tail + text
   return next.length > SKILLS_FAILURE_OUTPUT_TAIL ? next.slice(-SKILLS_FAILURE_OUTPUT_TAIL) : next
@@ -124,9 +134,10 @@ function runNpxSkills(args: string[]): Promise<number> {
     // Why: npx is an `#!/usr/bin/env node` script, so resolving it off PATH is
     // not enough — without node alongside it the child exits 127 with no
     // 'error' event and the message below never fires.
-    // Why: inherit would show a failure but hide it from us. Pipe stdout and
-    // stderr so a 0 exit that still printed "Installation failed" / "Canceled"
-    // becomes a failed command, and replay the bytes for the operator.
+    // Why: inherit would show output, but a 0 exit that still printed
+    // "Failed to install <n>" would look like success. Pipe and replay so that
+    // tail can change the status. A non-zero status, including skills@1.7.2's
+    // clone failure, is forwarded as-is.
     const child = spawn(spawnCmd, spawnArgs, {
       stdio: ['inherit', 'pipe', 'pipe'],
       // Why the shared helper: it verifies the sibling node actually exists,
@@ -136,16 +147,18 @@ function runNpxSkills(args: string[]): Promise<number> {
     })
     let outputTail = ''
     let settled = false
+    const pipes = guardSkillsChildPipes(child)
     const finish = (code: number | null, signal: NodeJS.Signals | null): void => {
       if (settled) {
         return
       }
       settled = true
+      pipes.stop()
       resolve(exitCodeForSkillsChild(code, signal, outputTail))
     }
     const track = (stream: NodeJS.ReadableStream | null, sink: NodeJS.WriteStream): void => {
       stream?.on('data', (chunk: Buffer | string) => {
-        outputTail = appendSkillsChildOutput(outputTail, chunk, sink)
+        outputTail = appendSkillsChildOutput(outputTail, chunk, sink, pipes.closed())
       })
     }
     track(child.stdout, process.stdout)
@@ -157,6 +170,7 @@ function runNpxSkills(args: string[]): Promise<number> {
         return
       }
       settled = true
+      pipes.stop()
       const detail = error instanceof Error ? error.message : String(error)
       reject(
         new RuntimeClientError(

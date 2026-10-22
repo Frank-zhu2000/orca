@@ -69,6 +69,9 @@ import { main } from './index'
 class FakeSkillsChild extends EventEmitter {
   readonly stdout = new PassThrough()
   readonly stderr = new PassThrough()
+  kill(): boolean {
+    return true
+  }
 }
 
 function stdoutText(spy: ReturnType<typeof vi.spyOn>): string {
@@ -92,42 +95,124 @@ describe('orca skills install exit code', () => {
     vi.restoreAllMocks()
   })
 
-  it('exits non-zero and surfaces the skills CLI error when install fails but the child exits 0', async () => {
-    const child = new FakeSkillsChild()
-    spawnMock.mockReturnValue(child)
+  async function finishChild(
+    child: FakeSkillsChild,
+    code: number,
+    write: () => void
+  ): Promise<{ stdout: string; stderr: string }> {
     const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
     const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
-
     const resultPromise = main(['skills', 'install', '--skill', 'alpha'], '/tmp/repo')
     await vi.waitFor(() => expect(spawnMock).toHaveBeenCalled())
-    child.stdout.write(
-      '■  Failed to clone repository\n' + '└  Installation failed\n' + '■  Canceled\n'
-    )
-    child.stderr.write('skills: clone failed\n')
-    child.emit('exit', 0, null)
-    child.emit('close', 0, null)
+    // Why: production waits for `close`, which is after the last chunk. Settling
+    // on `exit` would miss failure text that arrives between the two.
+    child.emit('exit', code, null)
+    write()
+    child.emit('close', code, null)
     await resultPromise
+    return { stdout: stdoutText(stdoutSpy), stderr: stdoutText(stderrSpy) }
+  }
+
+  it('forwards the skills CLI clone failure status and replays the error', async () => {
+    // Why: pinned skills@1.7.2 exits 1 for this transcript. Clack appends
+    // "Canceled" from its exit hook and does not change that status.
+    const child = new FakeSkillsChild()
+    spawnMock.mockReturnValue(child)
+    const output = await finishChild(child, 1, () => {
+      child.stdout.write(
+        '■  Failed to clone repository\n' + '└  Installation failed\n' + '■  Canceled\n'
+      )
+      child.stderr.write('skills: clone failed\n')
+    })
 
     expect(process.exitCode).toBe(1)
-    expect(stdoutText(stdoutSpy)).toContain('Installation failed')
-    expect(stdoutText(stdoutSpy)).toContain('Canceled')
-    expect(stdoutText(stderrSpy)).toContain('skills: clone failed')
+    expect(output.stdout).toContain('Installation failed')
+    expect(output.stdout).toContain('Canceled')
+    expect(output.stderr).toContain('skills: clone failed')
   })
 
   it('keeps a zero exit when the child output is not an install failure', async () => {
     const child = new FakeSkillsChild()
     spawnMock.mockReturnValue(child)
-    const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
-    vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
-
-    const resultPromise = main(['skills', 'install', '--skill', 'alpha'], '/tmp/repo')
-    await vi.waitFor(() => expect(spawnMock).toHaveBeenCalled())
-    child.stdout.write('Installed 1 skill\n')
-    child.emit('exit', 0, null)
-    child.emit('close', 0, null)
-    await resultPromise
+    const output = await finishChild(child, 0, () => {
+      child.stdout.write('Installed 1 skill\n')
+    })
 
     expect(process.exitCode).toBe(0)
-    expect(stdoutText(stdoutSpy)).toContain('Installed 1 skill')
+    expect(output.stdout).toContain('Installed 1 skill')
+  })
+
+  it('treats a zero exit as failure when Installation failed arrives before close', async () => {
+    // Why: this is a backstop for a 0 status that still printed the line, not
+    // the pinned CLI's clone path (that path exits 1 and is covered above).
+    const child = new FakeSkillsChild()
+    spawnMock.mockReturnValue(child)
+    const output = await finishChild(child, 0, () => {
+      child.stdout.write('└  Installation failed\n')
+    })
+
+    expect(process.exitCode).toBe(1)
+    expect(output.stdout).toContain('Installation failed')
+  })
+
+  it('treats a zero exit as failure when the skills CLI reports Failed to install N', async () => {
+    const child = new FakeSkillsChild()
+    spawnMock.mockReturnValue(child)
+    const output = await finishChild(child, 0, () => {
+      child.stdout.write('Failed to install 2\nDone!\n')
+    })
+
+    expect(process.exitCode).toBe(1)
+    expect(output.stdout).toContain('Failed to install 2')
+  })
+
+  it('keeps a zero exit for the symlink-copy warning', async () => {
+    const child = new FakeSkillsChild()
+    spawnMock.mockReturnValue(child)
+    await finishChild(child, 0, () => {
+      child.stdout.write(
+        'Symlinks failed for: cursor\n  Files were copied instead. On Windows, enable Developer Mode for symlink support.\n'
+      )
+    })
+
+    expect(process.exitCode).toBe(0)
+  })
+
+  it('kills the child and records its status when replaying into a closed pipe', async () => {
+    const child = new FakeSkillsChild()
+    let killed = false
+    child.kill = () => {
+      killed = true
+      child.emit('close', null, 'SIGTERM')
+      return true
+    }
+    spawnMock.mockReturnValue(child)
+    const uncaught: unknown[] = []
+    const onUncaught = (error: unknown): void => {
+      uncaught.push(error)
+    }
+    process.on('uncaughtException', onUncaught)
+    const epipe = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' })
+    vi.spyOn(process.stdout, 'write').mockImplementation(() => {
+      process.nextTick(() => {
+        process.stdout.emit('error', epipe)
+      })
+      return true
+    })
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+
+    try {
+      const resultPromise = main(['skills', 'install', '--skill', 'alpha'], '/tmp/repo')
+      await vi.waitFor(() => expect(spawnMock).toHaveBeenCalled())
+      child.stdout.write('cloning repository\n')
+      await vi.waitFor(() => {
+        expect(uncaught).toEqual([])
+        expect(killed).toBe(true)
+      })
+      await resultPromise
+      expect(process.exitCode).toBe(1)
+    } finally {
+      process.off('uncaughtException', onUncaught)
+    }
   })
 })
