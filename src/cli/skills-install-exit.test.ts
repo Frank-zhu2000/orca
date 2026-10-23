@@ -178,14 +178,31 @@ describe('orca skills install exit code', () => {
     expect(process.exitCode).toBe(0)
   })
 
+  it('forwards a non-zero close status when the output is not an install failure', async () => {
+    const child = new FakeSkillsChild()
+    spawnMock.mockReturnValue(child)
+    await finishChild(child, 2, () => {
+      child.stdout.write('Installed find-skills\nDone!\n')
+    })
+
+    expect(process.exitCode).toBe(2)
+  })
+
   it('kills the child and records its status when replaying into a closed pipe', async () => {
     const child = new FakeSkillsChild()
-    let killed = false
-    child.kill = () => {
-      killed = true
+    let settledChild = false
+    const settleIfPipesDestroyed = (): void => {
+      if (settledChild || !child.stdout.destroyed || !child.stderr.destroyed) {
+        return
+      }
+      settledChild = true
       child.emit('close', null, 'SIGTERM')
-      return true
     }
+    child.stdout.on('close', settleIfPipesDestroyed)
+    child.stderr.on('close', settleIfPipesDestroyed)
+    // kill() must not settle the child. The old fake emitted `close` here, which
+    // hid a grandchild that still held the pipe.
+    child.kill = () => true
     spawnMock.mockReturnValue(child)
     const uncaught: unknown[] = []
     const onUncaught = (error: unknown): void => {
@@ -201,17 +218,28 @@ describe('orca skills install exit code', () => {
     })
     vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
 
+    let resultPromise: Promise<void> | undefined
     try {
-      const resultPromise = main(['skills', 'install', '--skill', 'alpha'], '/tmp/repo')
+      resultPromise = main(['skills', 'install', '--skill', 'alpha'], '/tmp/repo')
       await vi.waitFor(() => expect(spawnMock).toHaveBeenCalled())
+      expect(spawnMock).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.any(Array),
+        expect.objectContaining({ detached: process.platform !== 'win32' })
+      )
       child.stdout.write('cloning repository\n')
       await vi.waitFor(() => {
         expect(uncaught).toEqual([])
-        expect(killed).toBe(true)
+        expect(child.stdout.destroyed).toBe(true)
+        expect(child.stderr.destroyed).toBe(true)
       })
       await resultPromise
       expect(process.exitCode).toBe(1)
     } finally {
+      if (!settledChild) {
+        child.emit('close', null, 'SIGTERM')
+      }
+      await resultPromise?.catch(() => undefined)
       process.off('uncaughtException', onUncaught)
     }
   })

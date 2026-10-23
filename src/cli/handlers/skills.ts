@@ -140,6 +140,10 @@ function runNpxSkills(args: string[]): Promise<number> {
     // clone failure, is forwarded as-is.
     const child = spawn(spawnCmd, spawnArgs, {
       stdio: ['inherit', 'pipe', 'pipe'],
+      // Why: the child must lead its own process group so a closed operator pipe
+      // can signal npx's descendants, not only the direct pid. Windows tree-kills
+      // with taskkill and must not detach — that opens another console.
+      detached: process.platform !== 'win32',
       // Why the shared helper: it verifies the sibling node actually exists,
       // skips a bare-name fallback whose dirname is '.', and writes the key
       // Windows will really read — all of which a local join got wrong.
