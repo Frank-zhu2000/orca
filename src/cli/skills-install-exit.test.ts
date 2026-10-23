@@ -166,6 +166,16 @@ describe('orca skills install exit code', () => {
     expect(output.stdout).toContain('Failed to install 2')
   })
 
+  it('keeps a zero exit for Failed to install find-skills', async () => {
+    const child = new FakeSkillsChild()
+    spawnMock.mockReturnValue(child)
+    await finishChild(child, 0, () => {
+      child.stdout.write('Failed to install find-skills\nDone!\n')
+    })
+
+    expect(process.exitCode).toBe(0)
+  })
+
   it('keeps a zero exit for the symlink-copy warning', async () => {
     const child = new FakeSkillsChild()
     spawnMock.mockReturnValue(child)

@@ -168,6 +168,35 @@ onPosix('skills child stdio teardown', () => {
       }
     }
   })
+
+  it('forwards SIGHUP to the detached group and re-raises it on this process', () => {
+    const child = spawnSleeper()
+    const signals: { pid: number; signal: string | number | undefined }[] = []
+    const kill = vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+      signals.push({ pid: Number(pid), signal })
+      return true
+    })
+    const before = new Set(process.listeners('SIGHUP'))
+    const guard = guardSkillsChildPipes(child)
+    try {
+      const added = process.listeners('SIGHUP').filter((listener) => !before.has(listener))
+      expect(added).toHaveLength(1)
+      added[0]?.('SIGHUP')
+      expect(signals).toEqual([
+        { pid: -(child.pid ?? 0), signal: 'SIGHUP' },
+        { pid: process.pid, signal: 'SIGHUP' }
+      ])
+      // The listener is gone before the re-raise, so delivery cannot loop.
+      expect(process.listeners('SIGHUP').filter((listener) => !before.has(listener))).toHaveLength(
+        0
+      )
+    } finally {
+      guard.stop()
+      kill.mockRestore()
+      killProcessGroup(child.pid)
+      child.kill()
+    }
+  })
 })
 
 describe('skills child pipe errors', () => {

@@ -1,13 +1,8 @@
-import { spawnSync } from 'node:child_process'
+import { startWindowsTreeKill } from '@orca/process-host/windows-tree-kill'
 
-// Narrower than ChildProcess so a test double does not need a cast. A real
-// ChildProcess is assignable: tree kill only needs the pid, the two pipes, and kill().
-type SkillsPipeChild = {
-  pid?: number
-  stdout: { destroy(): void } | null
-  stderr: { destroy(): void } | null
-  kill(signal?: NodeJS.Signals): boolean
-}
+// The same handle startWindowsTreeKill tracks. Callers pass the spawned npx
+// child, so this file does not import node:child_process.
+type SkillsPipeChild = Parameters<typeof startWindowsTreeKill>[0]
 
 function isBrokenPipeError(error: Error): boolean {
   return 'code' in error && error.code === 'EPIPE'
@@ -43,21 +38,27 @@ function signalSkillsChildGroup(child: SkillsPipeChild, signal: NodeJS.Signals):
   }
 }
 
-function killSkillsChildTree(child: SkillsPipeChild): void {
+function stopWindowsSkillsChild(child: SkillsPipeChild): void {
   const pid = child.pid
   if (pid == null || pid <= 0) {
     return
   }
-  if (process.platform === 'win32') {
-    // child.kill() is TerminateProcess on the direct cmd.exe. taskkill /T
-    // stops the tree. Detach is not used here: it would open a new console.
-    const result = spawnSync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
-      stdio: 'ignore',
-      windowsHide: true
-    })
-    if (result.error != null) {
+  // Why: System32 taskkill, a deadline, and TerminateProcess on the root when
+  // the verdict is unverifiable. A taskkill that runs and exits non-zero does
+  // not set an error, so it must still kill the root. Pipe destroy does not
+  // wait for that walk. Detach is not used on Windows: it opens a console.
+  startWindowsTreeKill(child, pid, () => {
+    try {
       child.kill()
+    } catch {
+      // The root can exit before this fallback runs.
     }
+  })
+}
+
+function killSkillsChildTree(child: SkillsPipeChild): void {
+  if (process.platform === 'win32') {
+    stopWindowsSkillsChild(child)
     return
   }
   signalSkillsChildGroup(child, 'SIGTERM')
@@ -86,12 +87,13 @@ export function guardSkillsChildPipes(child: SkillsPipeChild): SkillsChildPipeGu
     killSkillsChildTree(child)
     destroySkillsChildStdio(child)
   }
-  // Why: a detached POSIX child is not in the terminal's foreground group, so
-  // Ctrl+C reaches only this process. Forward it, then re-raise so the CLI
-  // still exits.
+  // Why: a detached POSIX child is not in the terminal's foreground group.
+  // Ctrl+C is SIGINT, and closing the terminal or dropping SSH is SIGHUP.
+  // Forward the signal, then re-raise it so the CLI still exits.
   const forward = (signal: NodeJS.Signals): void => {
     process.off('SIGINT', onSigint)
     process.off('SIGTERM', onSigterm)
+    process.off('SIGHUP', onSighup)
     try {
       signalSkillsChildGroup(child, signal)
     } finally {
@@ -104,11 +106,15 @@ export function guardSkillsChildPipes(child: SkillsPipeChild): SkillsChildPipeGu
   const onSigterm = (): void => {
     forward('SIGTERM')
   }
+  const onSighup = (): void => {
+    forward('SIGHUP')
+  }
   process.stdout.on('error', onPipeError)
   process.stderr.on('error', onPipeError)
   if (process.platform !== 'win32') {
     process.on('SIGINT', onSigint)
     process.on('SIGTERM', onSigterm)
+    process.on('SIGHUP', onSighup)
   }
   return {
     closed: () => closed,
@@ -117,6 +123,7 @@ export function guardSkillsChildPipes(child: SkillsPipeChild): SkillsChildPipeGu
       process.stderr.off('error', onPipeError)
       process.off('SIGINT', onSigint)
       process.off('SIGTERM', onSigterm)
+      process.off('SIGHUP', onSighup)
     }
   }
 }
